@@ -152,6 +152,59 @@ class MemoryInfo(NamedTuple):  # in bytes # pylint: disable=missing-class-docstr
     total: int | NaType
     free: int | NaType
     used: int | NaType
+    reserved: int | NaType = 0  # Added for unified memory support (v2 API)
+
+
+# Known unified memory device patterns (GPU names that use unified memory architecture)
+_UNIFIED_MEMORY_DEVICE_PATTERNS = (
+    'GB10',       # DGX Spark GB10 Grace Blackwell
+    'GB200',      # Grace Blackwell GB200
+    'GH200',      # Grace Hopper GH200
+    'Tegra',      # Tegra devices use unified memory
+    'Orin',       # Jetson Orin uses unified memory
+    'Xavier',     # Jetson Xavier uses unified memory
+)
+
+
+def _get_system_memory_total() -> int:
+    """Get total system memory in bytes using /proc/meminfo (Linux) or psutil fallback."""
+    try:
+        # Try reading from /proc/meminfo first (Linux-specific, no extra dependency)
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    # Line format: "MemTotal:       xxxxx kB"
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        mem_kb = int(parts[1])
+                        return mem_kb * 1024  # Convert kB to bytes
+    except (OSError, ValueError, IndexError):
+        pass
+
+    # Fallback to psutil if available
+    try:
+        import psutil
+        return psutil.virtual_memory().total
+    except ImportError:
+        pass
+
+    return 0
+
+
+def _is_unified_memory_device(device_name: str | NaType) -> bool:
+    """Check if the device uses unified memory architecture based on its name.
+
+    Args:
+        device_name: The name of the GPU device.
+
+    Returns:
+        True if the device is known to use unified memory architecture.
+    """
+    if device_name is NA or not isinstance(device_name, str):
+        return False
+
+    device_name_upper = device_name.upper()
+    return any(pattern.upper() in device_name_upper for pattern in _UNIFIED_MEMORY_DEVICE_PATTERNS)
 
 
 class ClockInfos(NamedTuple):  # in MHz # pylint: disable=missing-class-docstring
@@ -925,18 +978,42 @@ class Device:  # pylint: disable=too-many-instance-attributes,too-many-public-me
     def memory_info(self) -> MemoryInfo:  # in bytes
         """Return a named tuple with memory information (in bytes) for the device.
 
-        Returns: MemoryInfo(total, free, used)
+        For unified memory architecture (UMA) devices like DGX Spark (GB10), this method
+        returns system memory information since the GPU shares memory with the CPU.
+
+        Returns: MemoryInfo(total, free, used, reserved)
             A named tuple with memory information, the item could be :const:`nvitop.NA` when not applicable.
+            The `reserved` field is available when using NVML v2 API (driver 510+).
         """
         if self._handle is not None:
             memory_info = libnvml.nvmlQuery('nvmlDeviceGetMemoryInfo', self._handle)
             if libnvml.nvmlCheckReturn(memory_info):
+                total = memory_info.total
+                free = memory_info.free
+                used = memory_info.used
+                reserved = getattr(memory_info, 'reserved', 0)
+
+                # Check if this is a unified memory device (e.g., DGX Spark GB10)
+                # For UMA devices, the reported total from NVML may be incorrect or
+                # significantly smaller than actual available memory
+                device_name = self.name()
+                if _is_unified_memory_device(device_name):
+                    # For unified memory devices, use system memory as the total
+                    # since GPU can access the entire system RAM
+                    system_total = _get_system_memory_total()
+                    if system_total > 0 and system_total > total:
+                        # Recalculate free memory based on system total
+                        # free = system_total - used - reserved
+                        total = system_total
+                        free = total - used - reserved
+
                 return MemoryInfo(
-                    total=memory_info.total,
-                    free=memory_info.free,
-                    used=memory_info.used,
+                    total=total,
+                    free=free,
+                    used=used,
+                    reserved=reserved,
                 )
-        return MemoryInfo(total=NA, free=NA, used=NA)
+        return MemoryInfo(total=NA, free=NA, used=NA, reserved=0)
 
     def memory_total(self) -> int | NaType:  # in bytes
         """Total installed GPU memory in bytes.
@@ -1014,7 +1091,8 @@ class Device:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         Returns: Union[float, NaType]
             The percentage of used memory over total memory, or :const:`nvitop.NA` when not applicable.
         """
-        total, _, used = self.memory_info()
+        memory_info = self.memory_info()
+        total, used = memory_info.total, memory_info.used
         if libnvml.nvmlCheckReturn(used, int) and libnvml.nvmlCheckReturn(total, int):
             return round(100.0 * used / total, 1)
         return NA
@@ -1027,11 +1105,43 @@ class Device:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         """  # pylint: disable=line-too-long
         return f'{self.memory_used_human()} / {self.memory_total_human()}'
 
+    def memory_reserved(self) -> int | NaType:  # in bytes
+        """Memory reserved for system use (driver or firmware) in bytes.
+
+        This value is only available with NVML v2 API (driver 510+).
+
+        Returns: Union[int, NaType]
+            Memory reserved for system use in bytes, or 0 if not available.
+        """
+        return self.memory_info().reserved
+
+    def memory_reserved_human(self) -> str | NaType:  # in human-readable
+        """Memory reserved for system use in human-readable format.
+
+        Returns: Union[str, NaType]
+            Memory reserved for system use in human-readable format, or :const:`nvitop.NA` when not applicable.
+        """
+        reserved = self.memory_reserved()
+        if reserved == 0:
+            return '0B'
+        return bytes2human(reserved)
+
+    def is_unified_memory_device(self) -> bool:
+        """Check if this device uses unified memory architecture (UMA).
+
+        Unified memory devices like DGX Spark (GB10), Grace Hopper (GH200), and
+        Jetson devices share memory between CPU and GPU.
+
+        Returns: bool
+            True if the device uses unified memory architecture.
+        """
+        return _is_unified_memory_device(self.name())
+
     @memoize_when_activated
     def bar1_memory_info(self) -> MemoryInfo:  # in bytes
         """Return a named tuple with BAR1 memory information (in bytes) for the device.
 
-        Returns: MemoryInfo(total, free, used)
+        Returns: MemoryInfo(total, free, used, reserved)
             A named tuple with BAR1 memory information, the item could be :const:`nvitop.NA` when not applicable.
         """  # pylint: disable=line-too-long
         if self._handle is not None:
@@ -1041,8 +1151,9 @@ class Device:  # pylint: disable=too-many-instance-attributes,too-many-public-me
                     total=memory_info.bar1Total,
                     free=memory_info.bar1Free,
                     used=memory_info.bar1Used,
+                    reserved=0,  # BAR1 doesn't have reserved field
                 )
-        return MemoryInfo(total=NA, free=NA, used=NA)
+        return MemoryInfo(total=NA, free=NA, used=NA, reserved=0)
 
     def bar1_memory_total(self) -> int | NaType:  # in bytes
         """Total BAR1 memory in bytes.
@@ -1098,7 +1209,8 @@ class Device:  # pylint: disable=too-many-instance-attributes,too-many-public-me
         Returns: Union[float, NaType]
             The percentage of used BAR1 memory over total BAR1 memory, or :const:`nvitop.NA` when not applicable.
         """  # pylint: disable=line-too-long
-        total, _, used = self.bar1_memory_info()
+        memory_info = self.bar1_memory_info()
+        total, used = memory_info.total, memory_info.used
         if libnvml.nvmlCheckReturn(used, int) and libnvml.nvmlCheckReturn(total, int):
             return round(100.0 * used / total, 1)
         return NA

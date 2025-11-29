@@ -13,11 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
--
+- Unified memory device detection (GB10, GB200, GH200, Tegra, Orin, Xavier) via `is_unified_memory_device()` method; `memory_reserved()` and `memory_reserved_human()` methods; reserved field in `MemoryInfo` namedtuple; Resolves [#193](https://github.com/XuehaiPan/nvitop/issues/193)
 
 ### Changed
 
--
+- `memory_info()` now returns system RAM as total for UMA devices; `MemoryInfo` extended from 3 to 4 fields (backward compatible)
 
 ### Fixed
 
