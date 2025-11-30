@@ -191,6 +191,41 @@ def _get_system_memory_total() -> int:
     return 0
 
 
+def _get_system_memory_used() -> int:
+    """Get used system memory in bytes using /proc/meminfo (Linux) or psutil fallback.
+    
+    For UMA devices, this represents memory currently in use by both CPU and GPU.
+    """
+    try:
+        # Try reading from /proc/meminfo first (Linux-specific, no extra dependency)
+        mem_total = 0
+        mem_available = 0
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        mem_total = int(parts[1]) * 1024  # Convert kB to bytes
+                elif line.startswith('MemAvailable:'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        mem_available = int(parts[1]) * 1024  # Convert kB to bytes
+        if mem_total > 0 and mem_available > 0:
+            return mem_total - mem_available
+    except (OSError, ValueError, IndexError):
+        pass
+
+    # Fallback to psutil if available
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        return vm.total - vm.available
+    except ImportError:
+        pass
+
+    return 0
+
+
 def _is_unified_memory_device(device_name: str | NaType) -> bool:
     """Check if the device uses unified memory architecture based on its name.
 
@@ -980,40 +1015,88 @@ class Device:  # pylint: disable=too-many-instance-attributes,too-many-public-me
 
         For unified memory architecture (UMA) devices like DGX Spark (GB10), this method
         returns system memory information since the GPU shares memory with the CPU.
+        GPU-allocated memory is calculated by summing per-process GPU memory from
+        nvmlDeviceGetComputeRunningProcesses/nvmlDeviceGetGraphicsRunningProcesses.
 
         Returns: MemoryInfo(total, free, used, reserved)
             A named tuple with memory information, the item could be :const:`nvitop.NA` when not applicable.
             The `reserved` field is available when using NVML v2 API (driver 510+).
         """
+        total, free, used, reserved = NA, NA, NA, 0
+        nvml_success = False
+
         if self._handle is not None:
             memory_info = libnvml.nvmlQuery('nvmlDeviceGetMemoryInfo', self._handle)
             if libnvml.nvmlCheckReturn(memory_info):
+                nvml_success = True
                 total = memory_info.total
                 free = memory_info.free
                 used = memory_info.used
                 reserved = getattr(memory_info, 'reserved', 0)
 
-                # Check if this is a unified memory device (e.g., DGX Spark GB10)
-                # For UMA devices, the reported total from NVML may be incorrect or
-                # significantly smaller than actual available memory
-                device_name = self.name()
-                if _is_unified_memory_device(device_name):
-                    # For unified memory devices, use system memory as the total
-                    # since GPU can access the entire system RAM
-                    system_total = _get_system_memory_total()
-                    if system_total > 0 and system_total > total:
-                        # Recalculate free memory based on system total
-                        # free = system_total - used - reserved
-                        total = system_total
-                        free = total - used - reserved
+        # Check if this is a unified memory device (e.g., DGX Spark GB10)
+        device_name = self.name()
+        is_uma = _is_unified_memory_device(device_name)
 
-                return MemoryInfo(
-                    total=total,
-                    free=free,
-                    used=used,
-                    reserved=reserved,
-                )
-        return MemoryInfo(total=NA, free=NA, used=NA, reserved=0)
+        if is_uma:
+            # For unified memory devices, use system memory as the total
+            # since GPU can access the entire system RAM
+            system_total = _get_system_memory_total()
+
+            if system_total > 0:
+                # Get GPU-allocated memory by summing per-process GPU memory
+                # This works even when nvmlDeviceGetMemoryInfo fails on UMA devices
+                gpu_used = self._get_gpu_process_memory_sum()
+
+                if not nvml_success:
+                    # NVML memory query failed - use process sum for GPU used
+                    total = system_total
+                    if gpu_used > 0:
+                        used = gpu_used
+                        free = total - used
+                    else:
+                        # No GPU processes or query failed, fall back to system memory
+                        used = _get_system_memory_used()
+                        free = total - used
+                    reserved = 0
+                elif system_total > total:
+                    # NVML succeeded but reported smaller total, adjust
+                    total = system_total
+                    # Use GPU process sum if available, otherwise keep NVML value
+                    if gpu_used > 0:
+                        used = gpu_used
+                    free = total - used - reserved
+
+        return MemoryInfo(total=total, free=free, used=used, reserved=reserved)
+
+    def _get_gpu_process_memory_sum(self) -> int:
+        """Sum GPU memory used by all processes on this device.
+
+        This queries nvmlDeviceGetComputeRunningProcesses and
+        nvmlDeviceGetGraphicsRunningProcesses to get per-process GPU memory,
+        which works even on UMA devices where nvmlDeviceGetMemoryInfo fails.
+
+        Returns:
+            Total GPU memory used by all processes in bytes, or 0 if query fails.
+        """
+        if self._handle is None:
+            return 0
+
+        total_gpu_memory = 0
+        seen_pids = set()
+
+        for func in ('nvmlDeviceGetComputeRunningProcesses', 'nvmlDeviceGetGraphicsRunningProcesses'):
+            processes = libnvml.nvmlQuery(func, self._handle, default=())
+            for p in processes:
+                # Avoid double-counting processes that appear in both lists
+                if p.pid in seen_pids:
+                    continue
+                seen_pids.add(p.pid)
+
+                if isinstance(p.usedGpuMemory, int):
+                    total_gpu_memory += p.usedGpuMemory
+
+        return total_gpu_memory
 
     def memory_total(self) -> int | NaType:  # in bytes
         """Total installed GPU memory in bytes.
